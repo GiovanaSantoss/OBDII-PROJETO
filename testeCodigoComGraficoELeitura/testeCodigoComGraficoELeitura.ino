@@ -3,173 +3,260 @@
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
 #include <WiFi.h>
-#include <HTTPClient.h>
+#include <HTTPClient.h> 
+#include <SPI.h>
+#include "SdFat.h"
 
-// --- CONFIGURAÇÕES DE REDE E SERVIDOR ---
+// --- PINOUT TTGO LORA32 (O que funcionou) ---
+#define SD_CS    13
+#define SD_MOSI  15
+#define SD_MISO  2
+#define SD_SCK   14
+
+// --- CONFIGURAÇÕES DE REDE E ARQUIVO ---
 const char* ssid = "SAAENOT001";
 const char* password = "12345678";
-const char* serverName = "http://192.168.175.16/ProjetoELM/receber_dados.php";
+const char* serverUrl = "http://192.168.175.16/ProjetoELM/receber_dados.php";
+#define ARQUIVO_CARRO "/dados_carros.csv"
 
-// --- CONFIGURAÇÕES DO VEÍCULO (Para o seu PHP) ---
-String placaVeiculo = "BRA2E24"; 
-int viagemID = 1; 
-
-// UUIDs do adaptador (Baseado no seu LightBlue)
+// --- VARIÁVEIS BLE ---
 static BLEUUID serviceUUID("0000fff0-0000-1000-8000-00805f9b34fb");
 static BLEUUID charUUID    ("0000fff1-0000-1000-8000-00805f9b34fb"); 
-
-static boolean doConnect = false;
 static boolean connected = false;
+static boolean doConnect = false;
 static BLERemoteCharacteristic* pRemoteCharacteristic;
 static BLEAdvertisedDevice* myDevice;
 
-// Variáveis de Sensores
+// Dados dos Sensores
 float currentRPM = 0, currentKMH = 0, currentTemp = 0, currentVolt = 0;
-unsigned long lastDbUpload = 0;
-const int uploadInterval = 5000; 
+String placaVeiculo = "BRA2E24";
+int viagemID = 1;
+
+// --- TIMERS DE CONTROLE ---
+unsigned long wifiDownTimer = 0;
+unsigned long wifiUpTimer = 0;
+unsigned long lastLeituraELM = 0;
+const unsigned long TEMPO_VALIDACAO = 60000; // 1 minuto (Mude para 10000 para testar rápido)
+bool sdFuncional = false;
+
+SPIClass sdSPI(HSPI);
+SdFat sd;
+
+// --- PROTÓTIPOS DE FUNÇÕES (Para evitar erro de escopo) ---
+void processarLogicaEscritaEEnvio();
+String montarPacoteCSV();
+void enviarParaServidor(String pacote);
+void gravarNoSD(String dados);
+void descarregarSD();
 
 // --- FUNÇÕES DE APOIO ---
 
-long hexToDec(String hexString) {
-  return strtol(hexString.c_str(), NULL, 16);
-}
+long hexToDec(String hexString) { return strtol(hexString.c_str(), NULL, 16); }
 
-void enviarParaServidor() {
-  if (WiFi.status() == WL_CONNECTED) {
-    HTTPClient http;
-    http.begin(serverName);
-    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-
-    // Monta a string EXATAMENTE como o seu PHP espera no explode(',', $_POST['dados'])
-    // viagem_id, placa, millis, rpm, velocidade, temperatura, voltagem
-    String pacoteCSV = String(viagemID) + "," + 
-                       placaVeiculo + "," + 
-                       String(millis()) + "," + 
-                       String(currentRPM) + "," + 
-                       String(currentKMH) + "," + 
-                       String(currentTemp) + "," + 
-                       String(currentVolt);
-
-    String httpRequestData = "dados=" + pacoteCSV;
-    
-    int httpResponseCode = http.POST(httpRequestData);
-    Serial.print("HTTP Status Banco: "); Serial.println(httpResponseCode);
-    
-    if(httpResponseCode > 0) {
-      Serial.println("Resposta PHP: " + http.getString());
+void iniciarSD() {
+    sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+    if (sd.begin(SdSpiConfig(SD_CS, DEDICATED_SPI, SD_SCK_MHZ(4), &sdSPI))) {
+        Serial.println("[SD] Cartão Detectado com Sucesso!");
+        sdFuncional = true;
+    } else {
+        sdFuncional = false;
+        Serial.println("[SD] Erro ao iniciar cartão!");
     }
-    http.end();
-  }
 }
 
-// --- CALLBACK DE RECEBIMENTO ---
+String montarPacoteCSV() {
+    return String(viagemID) + "," + placaVeiculo + "," + String(millis()) + "," + 
+           String(currentRPM) + "," + String(currentKMH) + "," + 
+           String(currentTemp) + "," + String(currentVolt);
+}
 
+void gravarNoSD(String dados) {
+    if(!sdFuncional) return;
+    FsFile file;
+    if (file.open(ARQUIVO_CARRO, O_WRONLY | O_APPEND | O_CREAT)) {
+        file.println(dados);
+        file.close();
+        Serial.println("[SD] Dado Salvo (Sem WiFi > 1min)");
+    }
+}
+
+void enviarParaServidor(String pacote) {
+    if (WiFi.status() == WL_CONNECTED) {
+        HTTPClient http;
+        http.begin(serverUrl);
+        http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+        int res = http.POST("dados=" + pacote);
+        if(res > 0) Serial.println("[WEB] Enviado com sucesso!");
+        else Serial.println("[WEB] Erro no envio. Status: " + String(res));
+        http.end();
+    }
+}
+
+void descarregarSD() {
+    if (!sd.exists(ARQUIVO_CARRO)) return;
+    Serial.println("[SYNC] Descarregando SD...");
+    FsFile file;
+    if (file.open(ARQUIVO_CARRO, O_RDONLY)) {
+        char linha[128];
+        while (file.fgets(linha, sizeof(linha))) {
+            String sLinha = String(linha);
+            sLinha.trim();
+            if (sLinha.length() > 0) {
+                enviarParaServidor(sLinha);
+                delay(100);
+            }
+        }
+        file.close();
+        sd.remove(ARQUIVO_CARRO);
+        Serial.println("[SYNC] SD Limpo!");
+    }
+}
+
+// --- CALLBACKS BLE ---
 static void notifyCallback(BLERemoteCharacteristic* pChar, uint8_t* pData, size_t length, bool isNotify) {
-    String response = "";
-    for (int i = 0; i < length; i++) { response += (char)pData[i]; }
-    response.trim();
+    String resp = "";
+    for (int i = 0; i < length; i++) resp += (char)pData[i];
+    resp.trim();
     
-    // Processa RPM (01 0C)
-    if (response.indexOf("41 0C") != -1) {
-        int pos = response.indexOf("41 0C") + 6;
-        currentRPM = ((hexToDec(response.substring(pos, pos + 2)) * 256) + hexToDec(response.substring(pos + 3, pos + 5))) / 4.0;
+    if (resp.indexOf("41 0C") != -1) {
+        int pos = resp.indexOf("41 0C") + 6;
+        currentRPM = ((hexToDec(resp.substring(pos, pos + 2)) * 256) + hexToDec(resp.substring(pos + 3, pos + 5))) / 4.0;
+    } else if (resp.indexOf("41 0D") != -1) {
+        currentKMH = hexToDec(resp.substring(resp.indexOf("41 0D") + 6, resp.indexOf("41 0D") + 8));
+    } else if (resp.indexOf("41 05") != -1) {
+        currentTemp = hexToDec(resp.substring(resp.indexOf("41 05") + 6, resp.indexOf("41 05") + 8)) - 40;
+    } else if (resp.length() > 0 && resp.indexOf('.') != -1 && resp.indexOf('V') != -1) {
+        currentVolt = resp.substring(0, resp.indexOf('V')).toFloat();
     }
-    // Processa Velocidade (01 0D)
-    else if (response.indexOf("41 0D") != -1) {
-        int pos = response.indexOf("41 0D") + 6;
-        currentKMH = hexToDec(response.substring(pos, pos + 2));
-    }
-    // Processa Temperatura (01 05)
-    else if (response.indexOf("41 05") != -1) {
-        int pos = response.indexOf("41 05") + 6;
-        currentTemp = hexToDec(response.substring(pos, pos + 2)) - 40;
-    }
-    // Processa Voltagem (Resposta ao comando AT RV)
-    else if (response.length() > 0 && response.indexOf('.') != -1 && response.indexOf('V') != -1) {
-        currentVolt = response.substring(0, response.indexOf('V')).toFloat();
-    }
-
-    // Saída para Monitor e Gráfico
-    Serial.print("RPM:"); Serial.print(currentRPM);
-    Serial.print(",Velocidade:"); Serial.print(currentKMH);
-    Serial.print(",Temp:"); Serial.println(currentTemp);
 }
-
-// --- CLASSES DE CONEXÃO ---
 
 class MyClientCallback : public BLEClientCallbacks {
-  void onConnect(BLEClient* pclient) { connected = true; }
-  void onDisconnect(BLEClient* pclient) { connected = false; Serial.println("Desconectado!"); }
+    void onConnect(BLEClient* p) { connected = true; Serial.println("Conectado ao Carro!"); }
+    void onDisconnect(BLEClient* p) { connected = false; Serial.println("Carro Desconectado!"); }
 };
 
-class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
-  void onResult(BLEAdvertisedDevice advertisedDevice) {
-    if (advertisedDevice.haveServiceUUID() && advertisedDevice.isAdvertisingService(serviceUUID)) {
-      BLEDevice::getScan()->stop();
-      myDevice = new BLEAdvertisedDevice(advertisedDevice);
-      doConnect = true;
+class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
+    void onResult(BLEAdvertisedDevice adv) {
+        if (adv.isAdvertisingService(serviceUUID)) {
+            BLEDevice::getScan()->stop();
+            myDevice = new BLEAdvertisedDevice(adv);
+            doConnect = true;
+        }
     }
-  }
 };
 
-bool connectToServer() {
-    BLEClient* pClient = BLEDevice::createClient();
-    pClient->setClientCallbacks(new MyClientCallback());
-    pClient->connect(myDevice);
-    BLERemoteService* pRemoteService = pClient->getService(serviceUUID);
-    if (pRemoteService == nullptr) return false;
-    pRemoteCharacteristic = pRemoteService->getCharacteristic(charUUID);
-    if (pRemoteCharacteristic == nullptr) return false;
-    if(pRemoteCharacteristic->canNotify()) pRemoteCharacteristic->registerForNotify(notifyCallback);
-    return true;
+// --- FUNÇÃO DE LÓGICA CENTRAL ---
+void processarLogicaEscritaEEnvio() {
+    bool wifiOk = (WiFi.status() == WL_CONNECTED);
+
+    if (!wifiOk) {
+        wifiUpTimer = 0;
+        if (wifiDownTimer == 0) wifiDownTimer = millis();
+
+        if (millis() - wifiDownTimer > TEMPO_VALIDACAO) {
+            gravarNoSD(montarPacoteCSV());
+        } else {
+            Serial.print("WiFi Caído. Gravando no SD em: ");
+            Serial.print((TEMPO_VALIDACAO - (millis() - wifiDownTimer)) / 1000);
+            Serial.println("s");
+        }
+    } 
+    else {
+        wifiDownTimer = 0;
+        if (wifiUpTimer == 0) wifiUpTimer = millis();
+
+        // Envia dado atual em tempo real
+        enviarParaServidor(montarPacoteCSV());
+
+        // Se WiFi estável por 1min e carro parado, descarrega o SD
+        if ((millis() - wifiUpTimer > TEMPO_VALIDACAO) && (currentKMH <= 0.5)) {
+            descarregarSD();
+            wifiUpTimer = millis(); // Reseta para não repetir o loop imediatamente
+        } else if (millis() - wifiUpTimer < TEMPO_VALIDACAO) {
+            Serial.print("WiFi OK. Estabilizando para sincronizar SD em: ");
+            Serial.print((TEMPO_VALIDACAO - (millis() - wifiUpTimer)) / 1000);
+            Serial.println("s");
+        }
+    }
 }
 
-// --- SETUP E LOOP ---
-
+// --- SETUP ---
 void setup() {
-  Serial.begin(115200);
-  
-  WiFi.begin(ssid, password);
-  Serial.print("Conectando WiFi");
-  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
-  Serial.println("\nWiFi OK!");
+    Serial.begin(115200);
+    pinMode(18, OUTPUT); digitalWrite(18, HIGH); 
+    
+    iniciarSD();
 
-  BLEDevice::init("");
-  BLEScan* pBLEScan = BLEDevice::getScan();
-  pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
-  pBLEScan->setActiveScan(true); 
-  pBLEScan->start(15, false);
+    if (sdFuncional && !sd.exists(ARQUIVO_CARRO)){
+      FsFile file;
+
+      if(file.open(ARQUIVO_CARRO, O_WRONLY | O_CREAT)){
+        file.println("Viagem_ID, Placa, Timestamp_ms, RPM, Velocidade_KMH, Temp_Agua, Voltagem");
+        file.close();
+        Serial.println("[SD] Arquivo novo criado com cabeçalho.");
+      }
+    }
+
+    WiFi.begin(ssid, password);
+    Serial.println("Iniciando WiFi...");
+    
+    BLEDevice::init("");
+    BLEScan* pScan = BLEDevice::getScan();
+    pScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
+    pScan->start(15, false);
 }
 
+// --- LOOP ---
 void loop() {
-  if (doConnect) {
-    if (connectToServer()) {
-      Serial.println("Conectado ao Carro!");
-      pRemoteCharacteristic->writeValue("ATZ\r", 4);    delay(1500);
-      pRemoteCharacteristic->writeValue("ATE0\r", 5);   delay(500);
-      pRemoteCharacteristic->writeValue("ATSP0\r", 6);  delay(1000);
+    if (doConnect) {
+        BLEClient* pClient = BLEDevice::createClient();
+        pClient->setClientCallbacks(new MyClientCallback());
+        if (pClient->connect(myDevice)) {
+            BLERemoteService* pSvc = pClient->getService(serviceUUID);
+            if (pSvc) {
+                pRemoteCharacteristic = pSvc->getCharacteristic(charUUID);
+                if (pRemoteCharacteristic && pRemoteCharacteristic->canNotify()) {
+                    pRemoteCharacteristic->registerForNotify(notifyCallback);
+                    pRemoteCharacteristic->writeValue("ATZ\r", 4);    delay(1000);
+                    pRemoteCharacteristic->writeValue("ATE0\r", 5);   delay(500);
+                    pRemoteCharacteristic->writeValue("ATSP0\r", 6);  delay(500);
+                }
+            }
+        }
+        doConnect = false;
     }
-    doConnect = false;
-  }
 
-  if (connected) {
-    // Sequência de leitura
-    pRemoteCharacteristic->writeValue("010C\r", 5); delay(400); // RPM
-    pRemoteCharacteristic->writeValue("010D\r", 5); delay(400); // Velocidade
-    pRemoteCharacteristic->writeValue("0105\r", 5); delay(400); // Temperatura
-    pRemoteCharacteristic->writeValue("ATRV\r", 5); delay(400); // Voltagem da Bateria
+    // MODO SIMULAÇÃO (Se o carro estiver desconectado)
+    static unsigned long lastFakeData = 0;
+    if (!connected && (millis() - lastFakeData > 4000)){
+        lastFakeData = millis();
+        currentRPM = 1500 + random(0, 500);
+        currentKMH = 60 + random(0, 10); // Mude para 0 para testar o descarregamento do SD
+        currentTemp = 90;
+        currentVolt = 13.8;
 
-    // Envio para o Banco de Dados
-    if (millis() - lastDbUpload > uploadInterval) {
-        enviarParaServidor();
-        lastDbUpload = millis();
+        Serial.println("\n--- MODO SIMULAÇÃO (Sem ELM327) ---");
+        processarLogicaEscritaEEnvio();
     }
-  } else {
-    // Tenta reescanear se perder a conexão
-    static unsigned long lastRetry = 0;
-    if(millis() - lastRetry > 10000) {
-      BLEDevice::getScan()->start(5, false);
-      lastRetry = millis();
+
+    // MODO REAL (Se o carro conectar)
+    if (connected) {
+        if (millis() - lastLeituraELM > 4000) {
+            lastLeituraELM = millis();
+            pRemoteCharacteristic->writeValue("010C\r", 5); delay(300);
+            pRemoteCharacteristic->writeValue("010D\r", 5); delay(300);
+            pRemoteCharacteristic->writeValue("0105\r", 5); delay(300);
+            pRemoteCharacteristic->writeValue("ATRV\r", 5); delay(300);
+
+            Serial.println("\n--- MODO REAL (Lendo ELM327) ---");
+            processarLogicaEscritaEEnvio();
+        }
+    } else {
+        // Tenta re-escanear se perder a conexão
+        static unsigned long lastRetry = 0;
+        if(millis() - lastRetry > 15000) {
+            BLEDevice::getScan()->start(5, false);
+            lastRetry = millis();
+        }
     }
-  }
 }

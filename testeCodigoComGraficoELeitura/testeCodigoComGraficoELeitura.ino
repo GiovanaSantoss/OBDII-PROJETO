@@ -58,6 +58,15 @@ void iniciarSD() {
     if (sd.begin(SdSpiConfig(SD_CS, DEDICATED_SPI, SD_SCK_MHZ(4), &sdSPI))) {
         Serial.println("[SD] Cartão Detectado com Sucesso!");
         sdFuncional = true;
+
+        if (!sd.exists(ARQUIVO_CARRO)){
+            FsFile file;
+            if (file.open(ARQUIVO_CARRO, O_WRONLY | O_CREAT)){
+                file.println("Viagem_ID;Placa;Timestamp_ms;RPM;Velocidade_KMH;Temp_Agua;Voltagem");
+                file.close();
+                Serial.println("[SD] Novo arquivo criado com cabeçalho");
+            }
+        }
     } else {
         sdFuncional = false;
         Serial.println("[SD] Erro ao iniciar cartão!");
@@ -65,19 +74,39 @@ void iniciarSD() {
 }
 
 String montarPacoteCSV() {
-    return String(viagemID) + "," + placaVeiculo + "," + String(millis()) + "," + 
-           String(currentRPM) + "," + String(currentKMH) + "," + 
-           String(currentTemp) + "," + String(currentVolt);
+    return String(viagemID) + ";" + placaVeiculo + ";" + String(millis()) + ";" + 
+           String(currentRPM) + ";" + String(currentKMH) + ";" + 
+           String(currentTemp) + ";" + String(currentVolt);
 }
 
 void gravarNoSD(String dados) {
-    if(!sdFuncional) return;
-    FsFile file;
-    if (file.open(ARQUIVO_CARRO, O_WRONLY | O_APPEND | O_CREAT)) {
-        file.println(dados);
-        file.close();
-        Serial.println("[SD] Dado Salvo (Sem WiFi > 1min)");
+    if(!sdFuncional) {
+        Serial.println("[SD] Tentando detectar cartão...");
+        iniciarSD();
     }
+
+    if(!sdFuncional) {
+        return;
+    }
+
+    FsFile file;
+
+    if (!file.open(ARQUIVO_CARRO, O_RDWR| O_CREAT | O_AT_END)){
+        Serial.println("[SD] Erro ao abrir arquivo para escrita.");
+        Serial.println("[SD] Tentando resetar sistema de arquivos...");
+
+        sd.begin(SdSpiConfig(SD_CS, DEDICATED_SPI, SD_SCK_MHZ(4), &sdSPI));
+
+        if(!file.open(ARQUIVO_CARRO, O_RDWR | O_CREAT | O_AT_END)){
+            Serial.println("[SD] Falha persistente. Verifique o cartão.");
+            sdFuncional = false;
+            return;
+        }
+    }
+
+    file.println(dados);
+    file.close();
+    Serial.println("[SD] Dados gravados com sucesso!");
 }
 
 void enviarParaServidor(String pacote) {
@@ -87,8 +116,10 @@ void enviarParaServidor(String pacote) {
         http.addHeader("Content-Type", "application/x-www-form-urlencoded");
         int res = http.POST("dados=" + pacote);
         if(res > 0) Serial.println("[WEB] Enviado com sucesso!");
-        else Serial.println("[WEB] Erro no envio. Status: " + String(res));
+        else Serial.println("[WEB] Erro HTTP: " + String(res)); // Verifique se dá -1 (timeout)
         http.end();
+    } else {
+        Serial.println("[WEB] WiFi Desconectado no momento do envio!");
     }
 }
 
@@ -241,12 +272,14 @@ void loop() {
 
     // MODO REAL (Se o carro conectar)
     if (connected) {
-        if (millis() - lastLeituraELM > 4000) {
+        if (millis() - lastLeituraELM > 5000) {
             lastLeituraELM = millis();
             pRemoteCharacteristic->writeValue("010C\r", 5); delay(300);
             pRemoteCharacteristic->writeValue("010D\r", 5); delay(300);
             pRemoteCharacteristic->writeValue("0105\r", 5); delay(300);
             pRemoteCharacteristic->writeValue("ATRV\r", 5); delay(300);
+
+            delay(500);
 
             Serial.println("\n--- MODO REAL (Lendo ELM327) ---");
             processarLogicaEscritaEEnvio();

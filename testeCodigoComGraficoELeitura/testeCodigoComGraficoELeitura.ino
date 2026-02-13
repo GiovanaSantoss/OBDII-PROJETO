@@ -14,7 +14,7 @@
 #define SD_SCK   14
 
 // --- CONFIGURAÇÕES DE REDE E ARQUIVO ---
-const char* ssid = "SAAENOT001";
+const char* ssid = "SAAEDSK061 1507";
 const char* password = "12345678";
 const char* serverUrl = "http://192.168.175.16/ProjetoELM/receber_dados.php";
 #define ARQUIVO_CARRO "/dados_carros.csv"
@@ -53,11 +53,17 @@ void descarregarSD();
 
 long hexToDec(String hexString) { return strtol(hexString.c_str(), NULL, 16); }
 
+bool sdComDados =  false;
+
 void iniciarSD() {
     sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
     if (sd.begin(SdSpiConfig(SD_CS, DEDICATED_SPI, SD_SCK_MHZ(4), &sdSPI))) {
         Serial.println("[SD] Cartão Detectado com Sucesso!");
         sdFuncional = true;
+
+        if(sd.exists(ARQUIVO_CARRO)){
+            sdComDados = true;
+        }
 
         if (!sd.exists(ARQUIVO_CARRO)){
             FsFile file;
@@ -90,7 +96,7 @@ void gravarNoSD(String dados) {
     }
 
     FsFile file;
-
+  
     if (!file.open(ARQUIVO_CARRO, O_RDWR| O_CREAT | O_AT_END)){
         Serial.println("[SD] Erro ao abrir arquivo para escrita.");
         Serial.println("[SD] Tentando resetar sistema de arquivos...");
@@ -107,6 +113,13 @@ void gravarNoSD(String dados) {
     file.println(dados);
     file.close();
     Serial.println("[SD] Dados gravados com sucesso!");
+
+    if (file.open(ARQUIVO_CARRO, O_RDWR | O_CREAT | O_AT_END)){
+        file.println(dados);
+        file.close();
+        sdComDados = true;
+        Serial.println("[SD] Dados acumulados.");
+    }
 }
 
 void enviarParaServidor(String pacote) {
@@ -139,6 +152,7 @@ void descarregarSD() {
         }
         file.close();
         sd.remove(ARQUIVO_CARRO);
+        sdComDados = false;
         Serial.println("[SYNC] SD Limpo!");
     }
 }
@@ -196,17 +210,17 @@ void processarLogicaEscritaEEnvio() {
         wifiDownTimer = 0;
         if (wifiUpTimer == 0) wifiUpTimer = millis();
 
-        // Envia dado atual em tempo real
-        enviarParaServidor(montarPacoteCSV());
-
-        // Se WiFi estável por 1min e carro parado, descarrega o SD
-        if ((millis() - wifiUpTimer > TEMPO_VALIDACAO) && (currentKMH <= 0.5)) {
-            descarregarSD();
-            wifiUpTimer = millis(); // Reseta para não repetir o loop imediatamente
-        } else if (millis() - wifiUpTimer < TEMPO_VALIDACAO) {
-            Serial.print("WiFi OK. Estabilizando para sincronizar SD em: ");
-            Serial.print((TEMPO_VALIDACAO - (millis() - wifiUpTimer)) / 1000);
-            Serial.println("s");
+        if(sdComDados) {
+            if(millis() - wifiUpTimer > 5000) {
+                Serial.println("[PRIORIDADE] Esvaziando SD antes de iniciar leitura em tempo real.");
+                descarregarSD();
+            } else {
+                Serial.println("[WEB] WiFi detectado. Aguardando estabilização pra limpar SD...");
+            }
+        }
+        else {
+            Serial.println("[WEB] SD limpo. Enviando dados em tempo real...");
+            enviarParaServidor(montarPacoteCSV());
         }
     }
 }
